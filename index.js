@@ -5,8 +5,8 @@ require('dotenv').config();
 // Importaciones modularizadas
 const { respuestasFijas } = require('./config');
 const { clasificarPregunta, consultarGemini } = require('./services/gemini');
-// IMPORTANTE: Agregamos renovarToken acá
-const { obtenerDetallesPregunta, obtenerDetallesItem, enviarRespuestaMeli, renovarToken } = require('./services/meli');
+// IMPORTANTE: Ya no importamos obtenerDetallesItem porque ahora usamos la BD local
+const { obtenerDetallesPregunta, enviarRespuestaMeli, renovarToken } = require('./services/meli');
 const { enviarAlertaTelegram } = require('./services/telegram');
 const db = require('./services/db');
 const app = express();
@@ -84,7 +84,21 @@ app.post('/webhooks/meli', async (req, res) => {
 
     if (notification.topic === 'questions') {
         const questionId = notification.resource.split('/').pop();
-        const sellerId = notification.user_id;
+        const sellerId = notification.user_id.toString();
+
+        const modoBot = process.env.MODO_BOT || 'TEST';
+        const testUserId = process.env.TEST_USER_ID;
+        const prodUserId = process.env.PROD_USER_ID;
+
+        if (modoBot === 'TEST' && sellerId !== testUserId) {
+            console.log(`[Entorno TEST] Ignorando pregunta de la cuenta Real (${sellerId}). El bot no intervendrá.`);
+            return; // Corta el flujo. La pregunta queda sin responder por el bot.
+        }
+
+        if (modoBot === 'PROD' && sellerId !== prodUserId) {
+            console.log(`[Entorno PROD] Ignorando pregunta de la cuenta Test (${sellerId}).`);
+            return; 
+        }
 
         if (preguntasEnProceso.has(questionId)) {
             console.log(`[Webhook] Ignorando notificación duplicada para la pregunta: ${questionId}`);
@@ -92,12 +106,15 @@ app.post('/webhooks/meli', async (req, res) => {
         }
 
         preguntasEnProceso.add(questionId);
+        
+        setTimeout(() => {
+            if (preguntasEnProceso.has(questionId)) {
+                console.log(`[Seguridad] Removiendo pregunta ${questionId} por timeout de procesamiento.`);
+                preguntasEnProceso.delete(questionId);
+            }
+        }, 60000);
 
         try {
-            // =================================================================
-            // LA MAGIA CON AUTO-REFRESH
-            // =================================================================
-            // Ahora traemos todo: access, refresh y vencimiento
             const dbRes = await db.query('SELECT access_token, refresh_token, expires_at FROM meli_tokens WHERE user_id = $1', [sellerId.toString()]);
             
             if (dbRes.rows.length === 0) {
@@ -111,7 +128,6 @@ app.post('/webhooks/meli', async (req, res) => {
             const expiresAtBD = new Date(dbRes.rows[0].expires_at);
             const ahora = new Date();
 
-            // Le damos un margen de 5 minutos de seguridad antes del vencimiento real
             const margenSeguridad = new Date(ahora.getTime() + 5 * 60000);
 
             if (margenSeguridad >= expiresAtBD) {
@@ -120,11 +136,10 @@ app.post('/webhooks/meli', async (req, res) => {
                 try {
                     const nuevosTokens = await renovarToken(refreshTokenBD);
                     
-                    tokenDinamico = nuevosTokens.access_token; // Pisamos la variable para usarla ahora
+                    tokenDinamico = nuevosTokens.access_token; 
                     const nuevoRefreshTokenBD = nuevosTokens.refresh_token;
                     const nuevaFechaVencimiento = new Date(Date.now() + (nuevosTokens.expires_in * 1000));
 
-                    // Actualizamos la base de datos
                     await db.query(`
                         UPDATE meli_tokens 
                         SET access_token = $1, refresh_token = $2, expires_at = $3, updated_at = CURRENT_TIMESTAMP
@@ -135,12 +150,11 @@ app.post('/webhooks/meli', async (req, res) => {
                 } catch (errorRenovacion) {
                     console.error(`[Token] Falló la renovación automática para el vendedor ${sellerId}.`);
                     preguntasEnProceso.delete(questionId);
-                    return; // Cortamos porque sin token no podemos hacer nada
+                    return; 
                 }
             } else {
                 console.log(`[Token] Usando token de BD para el vendedor ${sellerId} (Válido hasta ${expiresAtBD.toLocaleString()})`);
             }
-            // =================================================================
 
             console.log(`[Webhook] Nueva pregunta detectada: ${questionId}`);
 
@@ -151,11 +165,26 @@ app.post('/webhooks/meli', async (req, res) => {
                 
                 console.log(`Pregunta recibida: "${preguntaTexto}" para el ítem: ${itemId}`);
 
-                const numeroPieza = await obtenerNumeroPieza(itemId, tokenDinamico);
-                console.log(`Número de pieza identificado en la publicación: ${numeroPieza}`);
+                // =================================================================
+                // NUEVA LÓGICA: Consultamos los datos en nuestra propia BD
+                // =================================================================
+                const queryProducto = `SELECT titulo_meli, oem, compatibilidad FROM productos WHERE meli_item_id = $1 LIMIT 1`;
+                const dbProdRes = await db.query(queryProducto, [itemId]);
+
+                if (dbProdRes.rows.length === 0) {
+                    console.log(`[Alerta] El producto ${itemId} no está en la base de datos local. Derivando a manual.`);
+                    await enviarAlertaTelegram(preguntaTexto, "Desconocido", questionId, itemId);
+                    preguntasEnProceso.delete(questionId);
+                    return;
+                }
+
+                // Armamos un objeto con todos los datos clave de la tabla
+                const producto = dbProdRes.rows[0];
+                console.log(`Ítem BD: "${producto.titulo_meli}" | OEM: ${producto.oem}`);
 
                 console.log(`[Router] Analizando intención de la pregunta...`);
-                const intencion = await clasificarPregunta(preguntaTexto, numeroPieza);
+                // Le pasamos a la IA todo el contexto del producto
+                const intencion = await clasificarPregunta(preguntaTexto, producto); 
                 console.log(`[Router] Intención detectada: ${intencion}`);
 
                 let textoRespuesta = "";
@@ -168,11 +197,11 @@ app.post('/webhooks/meli', async (req, res) => {
                         break;
                     
                     case "COMPATIBILIDAD_SEGURA":
-                        textoRespuesta = await consultarGemini(preguntaTexto, numeroPieza);
+                        textoRespuesta = await consultarGemini(preguntaTexto, producto);
                         break;
 
                     case "REVISION_MANUAL":
-                        await enviarAlertaTelegram(preguntaTexto, numeroPieza, questionId, itemId);
+                        await enviarAlertaTelegram(preguntaTexto, producto.oem, questionId, itemId);
                         console.log(`[Atención] Pregunta derivada a REVISIÓN MANUAL: ${questionId}. El bot no responderá.`);
                         preguntasEnProceso.delete(questionId);
                         return; 
@@ -195,64 +224,6 @@ app.post('/webhooks/meli', async (req, res) => {
             console.error('Error procesando el flujo automático:', err.message);
             preguntasEnProceso.delete(questionId);
         }
-    }
-});
-
-/**
- * =================================================================
- * ENDPOINTS DE PRUEBA
- * =================================================================
- */
-app.post('/test-gemini', async (req, res) => {
-    try {
-        const { pregunta, numeroPieza } = req.body;
-
-        if (!pregunta || !numeroPieza) {
-            return res.status(400).json({ error: "El JSON debe incluir 'pregunta' y 'numeroPieza'." });
-        }
-
-        console.log(`\n[Test IA] Evaluando compatibilidad...`);
-        console.log(`Pieza: ${numeroPieza} | Vehículo/Pregunta: "${pregunta}"`);
-
-        const respuestaIA = await consultarGemini(pregunta, numeroPieza);
-        
-        console.log(`[Test IA] Respuesta generada:\n${respuestaIA}\n`);
-
-        res.json({
-            exito: true,
-            respuesta_generada: respuestaIA
-        });
-
-    } catch (error) {
-        console.error('[Test IA] Error en la IA:', error.message);
-        res.status(500).json({ 
-            exito: false, 
-            error: error.message,
-            detalle: error.response ? error.response.data : "Error desconocido"
-        });
-    }
-});
-
-app.post('/test-router', async (req, res) => {
-    try {
-        const { pregunta, numeroPieza } = req.body;
-
-        if (!pregunta || !numeroPieza) {
-            return res.status(400).json({ error: "Faltan datos." });
-        }
-
-        console.time("Tiempo de clasificación");
-        const intencion = await clasificarPregunta(pregunta, numeroPieza);
-        console.timeEnd("Tiempo de clasificación");
-
-        res.json({
-            exito: true,
-            pregunta_evaluada: pregunta,
-            intencion_detectada: intencion
-        });
-
-    } catch (error) {
-        res.status(500).json({ exito: false, error: error.message });
     }
 });
 

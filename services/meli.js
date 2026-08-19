@@ -110,5 +110,6 @@ module.exports = {
     obtenerDetallesPregunta,
     obtenerNumeroPieza,
     enviarRespuestaMeli,
-    renovarToken
+    renovarToken,
+    obtenerDetallesItem
 };

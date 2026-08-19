@@ -1,27 +1,43 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { promptClasificador } = require('../config'); // Importamos el prompt desde la raíz
 require('dotenv').config();
 
 // Inicializamos Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ 
     model: "gemini-2.5-flash",
-    systemInstruction: `Sos un asistente experto en atención al cliente para una tienda de repuestos automotores especializada en mangueras y bombas de agua. 
-    Tu objetivo es responder si un producto es compatible con el vehículo del cliente basándote estrictamente en el "Número de pieza" provisto.
+    systemInstruction: `Sos un asistente experto en atención al cliente para una tienda de repuestos automotores especializada en Mercado Libre.
+    Tu objetivo es responder a los clientes basándote ÚNICAMENTE en la información técnica estricta que se te provee.
     
     Reglas de comportamiento:
     1. Sé amable, profesional y directo.
-    2. Si estás 100% seguro de que el número de pieza aplica al auto consultado (modelo, año y motor), confirmalo con seguridad.
-    3. Si tenés la más mínima duda, o si el cliente no especificó el año exacto, motor o modelo de su auto, respondé amablemente solicitando los datos faltantes (por ejemplo: "Para confirmarte con exactitud, ¿me podrías pasar el año y motorización de tu auto, o los últimos dígitos del chasis?"). Nunca arriesgues una respuesta afirmativa si hay ambigüedad.
-    4. Tus respuestas deben ser concisas, pensadas para leerse rápido en la sección de preguntas de Mercado Libre.
-    5. si el cliente pregunta si hay stock de la pieza responde que sí, que hay stock y que puede comprarla sin problemas. Todas nuestras piezas publicadas estan disponibles.
-    6.Si el cliente pregunta por  algo que no tiene que ver con la compatibilidad de la pieza, respondé amablemente y no le preguntes sobre la pieza.
-    `
+    2. Las respuestas deben ser concisas, pensadas para leerse rápido.
+    3. NUNCA inventes información de compatibilidad.
+    4. NUNCA le hagas preguntas de seguimiento al cliente (por ejemplo, NO preguntes "qué año es tu auto").`
 });
 
-// Función que actúa como Router inicial
-async function clasificarPregunta(pregunta, numeroPieza) {
-    const prompt = promptClasificador(pregunta, numeroPieza);
+// Función que actúa como Router inicial (Ahora incluye el JSON de la BD)
+async function clasificarPregunta(pregunta, producto) {
+    const prompt = `
+    Sos un clasificador estricto de intenciones. 
+    Analizá la pregunta del cliente en base a nuestros datos de producto y devolvé un JSON válido.
+    
+    DATOS DEL PRODUCTO EN BASE DE DATOS:
+    - Título: "${producto.titulo_meli}"
+    - Número OEM: "${producto.oem}"
+    - Tabla estricta de compatibilidad (JSON): ${producto.compatibilidad}
+
+    CATEGORÍAS PERMITIDAS:
+    - "STOCK": Si el cliente pregunta si hay disponibilidad ("¿Tenés stock?", "¿Te queda?").
+    - "LOCAL": Si pregunta por envíos, ubicaciones o retiro en persona.
+    - "AGRADECIMIENTO": Agradecimientos o saludos finales.
+    - "COMPATIBILIDAD_SEGURA": ÚNICAMENTE si el auto del cliente (modelo y año) coincide EXACTAMENTE con alguno de los vehículos listados en la "Tabla estricta de compatibilidad".
+    - "REVISION_MANUAL": En cualquier otro caso. Si falta el año en la pregunta, si el año no está en el rango permitido, o si pregunta por otra cosa.
+
+    Pregunta del cliente: "${pregunta}"
+    
+    Devolvé ÚNICAMENTE un JSON con este formato exacto:
+    {"intencion": "TIPO_DE_INTENCION"}
+    `;
     
     const result = await model.generateContent({
         contents: [{ role: "user", parts: [{ text: prompt }]}],
@@ -37,9 +53,25 @@ async function clasificarPregunta(pregunta, numeroPieza) {
     }
 }
 
-// Función para interactuar con la API de Gemini
-async function consultarGemini(pregunta, numeroPieza) {
-    const prompt = `Un cliente pregunta: "${pregunta}". \nEl número de pieza del repuesto que está mirando es: "${numeroPieza}". \n¿Es compatible? Respondé siguiendo tus instrucciones de sistema.`;
+// Función para redactar la respuesta (Con contexto inyectado)
+async function consultarGemini(pregunta, producto) {
+    const prompt = `
+    El sistema ya validó que este producto ES TOTALMENTE COMPATIBLE con el vehículo del cliente.
+    
+    DETALLES DE NUESTRO REPUESTO:
+    - Título: "${producto.titulo_meli}"
+    - Número de pieza de fábrica (OEM): "${producto.oem}"
+    
+    PREGUNTA DEL CLIENTE:
+    "${pregunta}"
+
+    INSTRUCCIONES:
+    - Redactá una respuesta confirmando la compatibilidad de forma segura, amable y directa.
+    - Podés usar un tono cercano (ej: "Hola, ¿cómo estás? Sí, te confirmo que le va perfecto a tu auto. Esperamos tu compra!").
+    - BAJO NINGÚN PUNTO DE VISTA le hagas preguntas de seguimiento al cliente.
+    - No expliques que "verificaste en la base de datos", respondé como si lo supieras naturalmente.
+    `;
+    
     const result = await model.generateContent(prompt);
     return result.response.text();
 }
